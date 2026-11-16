@@ -65,79 +65,49 @@ func (s style) header(slice, version string, arches []string) string {
 	return s.wrap(s.name, slice) + version + " " + s.wrap(s.dim, "["+strings.Join(arches, ", ")+"]")
 }
 
-// line is an item as the text report prints it, "<path> (<owner>):
-// <severity> <kind> <name>: <reason>", with the architecture normalised
-// unless raw.
-func line(it check.Item, raw bool) string {
-	if !raw {
-		return fold.Normalise(line(it, true), it.Arch)
-	}
-	p := it.Path
-	if it.Owner != "" {
-		p += " (" + it.Owner + ")"
-	}
-	name := it.Name
-	if it.Feature != "" {
-		name += " (" + it.Feature + ", " + it.Priority + ")"
-	}
-	return fmt.Sprintf("%s: %s %s %s: %s", p, it.Severity, it.Kind, name, it.Reason)
-}
-
-// renderText prints one block per (slice counted against, arches that
-// agree), the not-available ones after. Nothing is indented, so the report
-// greps: grep ': hard ' is what does not run.
-func renderText(w io.Writer, rep *check.Report, noGroup bool, prune []string, st style) {
-	var blocks []string
-	byAgainst := map[string][]check.Item{}
-	for _, it := range rep.Items {
-		if it.Severity == check.Info && (pruned(prune, it.Arch, "", it.Path) || prunedAny(prune, it.Arch, strings.Split(it.Name, " or "))) {
+// renderText prints, per block, the findings and the dlopens the cut does
+// not answer among the block's lines, one a line as "<path> (<owner>):
+// <severity> <kind> <name>: <reason>", worst first. Nothing is indented, so
+// the report greps: grep ': hard ' is what does not run. A tree says a
+// thing wherever it is reached and this report once: a line every
+// architecture of a block was told already, in a block before it, is left
+// out, and a block with nothing left prints nothing.
+func renderText(w io.Writer, rep *check.Report, noGroup bool, prune, folds []string, st style) {
+	told := map[string]bool{} // slice, architecture and line
+	for _, b := range blocks(rep, noGroup, prune, folds) {
+		var lines []*tline
+		seen := map[string]bool{}
+		var walk func(ts []*tline)
+		walk = func(ts []*tline) {
+			for _, t := range ts {
+				if t.flat != "" && !t.context && !seen[t.flat] {
+					seen[t.flat] = true
+					news := false
+					for _, a := range b.Arches {
+						k := b.Slice + "\x00" + a + "\x00" + fold.Normalise(t.flat, a)
+						news = news || !told[k]
+						told[k] = true
+					}
+					if news {
+						lines = append(lines, t)
+					}
+				}
+				walk(t.kids)
+			}
+		}
+		walk(b.Roots)
+		if len(lines) == 0 {
 			continue
 		}
-		k := it.Against
-		if !it.Named {
-			k += " reached via " + it.Reached
-		}
-		if _, ok := byAgainst[k]; !ok {
-			blocks = append(blocks, k)
-		}
-		byAgainst[k] = append(byAgainst[k], it)
-	}
-	for _, b := range blocks {
-		items := make([][]fold.Item, len(rep.Arches))
-		for _, it := range byAgainst[b] {
-			ai := slices.Index(rep.Arches, it.Arch)
-			items[ai] = append(items[ai], fold.Item{Key: line(it, false), Tag: it.Sev, Raw: line(it, true)})
-		}
-		slice, rest, _ := strings.Cut(b, " ")
-		via := ""
-		if r, ok := strings.CutPrefix(rest, "reached via "); ok {
-			via = " " + st.wrap(st.dim, "reached via") + " " + r
-		}
-		groups := fold.Fold(rep.Arches, items)
-		if noGroup {
-			groups = nil
-			for ai, a := range rep.Arches {
-				if len(items[ai]) == 0 {
-					continue
-				}
-				g := fold.Group{Arches: []string{a}}
-				for _, it := range items[ai] {
-					g.Entries = append(g.Entries, fold.Entry{Key: it.Raw, Tag: it.Tag, Raw: []string{it.Raw}})
-				}
-				slices.SortFunc(g.Entries, func(x, y fold.Entry) int { return strings.Compare(x.Key, y.Key) })
-				groups = append(groups, g)
+		slices.SortStableFunc(lines, func(x, y *tline) int {
+			if x.sev != y.sev {
+				return int(x.sev) - int(y.sev)
 			}
-		}
-		for _, g := range groups {
-			slices.SortStableFunc(g.Entries, func(x, y fold.Entry) int { return int(severity(x.Tag)) - int(severity(y.Tag)) })
-			fmt.Fprintln(w, st.header(slice, pkgVersion(rep, slice, g.Arches[0]), g.Arches)+via)
-			for _, e := range g.Entries {
-				text := e.Shown()
-				if len(g.Arches) == 1 {
-					text = e.Raw[0]
-				}
-				fmt.Fprintln(w, st.sev(severity(e.Tag), text))
-			}
+			return strings.Compare(x.flat, y.flat)
+		})
+		fmt.Fprintln(w, st.header(b.Slice, b.Version, b.Arches))
+		for _, t := range lines {
+			fmt.Fprintln(w, st.sev(t.sev, t.flat))
 		}
 	}
 	notes(w, rep, st)
@@ -202,15 +172,6 @@ func prunedAny(prune []string, arch string, names []string) bool {
 	return false
 }
 
-func severity(name string) check.Severity {
-	for _, s := range []check.Severity{check.Hard, check.Soft, check.Warning, check.Info} {
-		if s.String() == name {
-			return s
-		}
-	}
-	return check.Info
-}
-
 // pkgVersion is the version of slice's package as the cuts on arch fetched
 // it, after a space; "" when no cut did.
 func pkgVersion(rep *check.Report, slice, arch string) string {
@@ -261,12 +222,64 @@ func plural(n int, one, many string) string {
 	return many
 }
 
+// paint is how a part of a line is coloured.
+type paint int
+
+const (
+	paintNone paint = iota
+	paintDim
+	paintDlopen
+	paintHard
+	paintSoft
+	paintInfo
+)
+
+func paintOf(sev check.Severity) paint {
+	switch sev {
+	case check.Hard:
+		return paintHard
+	case check.Soft, check.Warning:
+		return paintSoft
+	}
+	return paintInfo
+}
+
+func (s style) paint(p paint, text string) string {
+	switch p {
+	case paintDim, paintInfo:
+		return s.wrap(s.dim, text)
+	case paintDlopen:
+		return s.wrap(s.dlopen, text)
+	case paintHard:
+		return s.wrap(s.red, text)
+	case paintSoft:
+		return s.wrap(s.yellow, text)
+	}
+	return text
+}
+
+// seg is a part of a line that is painted one way.
+type seg struct {
+	text  string
+	paint paint
+}
+
 // tline is one line of a tree and the lines drawn under it. alert is a
 // finding or an unanswered dlopen worse than info, which --prune never hides.
 type tline struct {
-	text  string
+	segs  []seg
 	kids  []*tline
 	alert bool
+	// flat is the line as the text report prints it, for a finding or a
+	// dlopen the cut does not answer, and sev its severity; "" for any
+	// other line.
+	flat string
+	sev  check.Severity
+	// context is a line a block draws only to hold what is under it: the
+	// line itself belongs to a block of more architectures.
+	context bool
+	// at is where the line stands among the lines under its parent.
+	at int
 	// group, rank and name order the lines under a node: what the loader
 	// links in itself (group 0) before dlopens, required, recommended and
 	// suggested (groups 1 to 3). In group 0 the dynamic loader comes first,
@@ -299,6 +312,35 @@ func group(p string) int {
 	return 2
 }
 
+// say adds a part to the line.
+func (t *tline) say(p paint, text string) *tline {
+	if text != "" {
+		t.segs = append(t.segs, seg{text, p})
+	}
+	return t
+}
+
+// plain is the line with no colour.
+func (t *tline) plain() string {
+	var b strings.Builder
+	for _, s := range t.segs {
+		b.WriteString(s.text)
+	}
+	return b.String()
+}
+
+// painted is the line as st colours it, a context line all dim.
+func (t *tline) painted(st style) string {
+	if t.context {
+		return st.wrap(st.dim, t.plain())
+	}
+	var b strings.Builder
+	for _, s := range t.segs {
+		b.WriteString(st.paint(s.paint, s.text))
+	}
+	return b.String()
+}
+
 // alerts reports whether t or anything under it is an alert.
 func (t *tline) alerts() bool {
 	if t.alert {
@@ -316,7 +358,7 @@ func (t *tline) alerts() bool {
 // it, as chisel-diff --tree does.
 func drawTree(w io.Writer, roots []*tline, st style) {
 	for _, r := range roots {
-		fmt.Fprintln(w, r.text)
+		fmt.Fprintln(w, r.painted(st))
 		drawKids(w, r.kids, "", st)
 	}
 }
@@ -327,12 +369,12 @@ func drawKids(w io.Writer, kids []*tline, prefix string, st style) {
 		if i == len(kids)-1 {
 			glyph, pad = "└─ ", "   "
 		}
-		fmt.Fprintln(w, st.wrap(st.dim, prefix+glyph)+k.text)
+		fmt.Fprintln(w, st.wrap(st.dim, prefix+glyph)+k.painted(st))
 		drawKids(w, k.kids, prefix+pad, st)
 	}
 }
 
-// renderTree draws, per named slice and arch, every start node the slice
+// renderTree draws every block as a tree: every start node the slice
 // itself delivers, what it is and what loading it reached, lddtree style:
 // each edge is "<kind> <name> -> <path> (<owner>)", what the loader links
 // in itself first and dlopen edges after, the dynamic loader first among
@@ -340,17 +382,10 @@ func drawKids(w io.Writer, kids []*tline, prefix string, st style) {
 // with what loading it reaches, "!" is a finding and "?" a dlopen entry the
 // cut does not answer, with what lookup made of it. Every node is drawn in
 // full wherever it is reached, but for one already on the way down to it.
-func renderTree(w io.Writer, rep *check.Report, prune, fold []string, st style) {
-	views := map[*check.Cut]*view{}
-	for _, s := range rep.Named {
-		for _, a := range rep.Arches {
-			c := rep.Cuts[check.Key{Slice: s, Arch: a}]
-			if c == nil || c.Res == nil || c.NoFile {
-				continue
-			}
-			fmt.Fprintln(w, st.header(s, pkgVersion(rep, s, a), []string{a}))
-			drawTree(w, treeOf(rep, c, s, views, prune, fold, st), st)
-		}
+func renderTree(w io.Writer, rep *check.Report, noGroup bool, prune, folds []string, st style) {
+	for _, b := range blocks(rep, noGroup, prune, folds) {
+		fmt.Fprintln(w, st.header(b.Slice, b.Version, b.Arches))
+		drawTree(w, b.Roots, st)
 	}
 	notes(w, rep, st)
 }
@@ -427,15 +462,26 @@ func viewOf(views map[*check.Cut]*view, c *check.Cut) *view {
 // slice outside the cut delivers is drawn from that slice's cut, unless fold
 // has "missing". A library --prune names is left out with all under it,
 // unless an alert is.
-func treeOf(rep *check.Report, c *check.Cut, s string, views map[*check.Cut]*view, prune, fold []string, st style) []*tline {
+func treeOf(rep *check.Report, c *check.Cut, s string, views map[*check.Cut]*view, prune, folds []string) []*tline {
 	a := c.Arch
-	owner := func(v *view, p string) string {
+	// owner adds the slices delivering p to a line, dim.
+	owner := func(t *tline, v *view, p string) *tline {
 		o := slices.Clone(v.c.Owners[p])
 		slices.Sort(o)
 		if len(o) == 0 {
-			return ""
+			return t
 		}
-		return " " + st.wrap(st.dim, "("+strings.Join(o, ", ")+")")
+		return t.say(paintNone, " ").say(paintDim, "("+strings.Join(o, ", ")+")")
+	}
+	// flat is a line of the text report about the file from, whose slices
+	// are named unless s is one of them.
+	flat := func(v *view, from string, sev check.Severity, kind, name, reason string) string {
+		o := slices.Clone(v.c.Owners[from])
+		slices.Sort(o)
+		if len(o) > 0 && !slices.Contains(o, s) {
+			from += " (" + strings.Join(o, ", ") + ")"
+		}
+		return fmt.Sprintf("%s: %s %s %s: %s", from, sev, kind, name, reason)
 	}
 	verdict := map[string]check.Item{}
 	for _, it := range rep.Items {
@@ -443,50 +489,80 @@ func treeOf(rep *check.Report, c *check.Cut, s string, views map[*check.Cut]*vie
 			verdict[it.Path+"\x00"+it.Name] = it
 		}
 	}
-	finding := func(f resolve.Finding) *tline {
-		t := &tline{text: st.sev(check.Severity(f.Severity), fmt.Sprintf("! %s %s: %s", f.Kind, f.Name, f.Reason)), alert: true, rank: rankFinding, name: f.Name}
+	finding := func(v *view, f resolve.Finding) *tline {
+		sev := check.Severity(f.Severity)
+		t := &tline{alert: true, rank: rankFinding, name: f.Name, sev: sev}
+		t.say(paintOf(sev), fmt.Sprintf("! %s %s: %s", f.Kind, f.Name, f.Reason))
+		name, reason := f.Name, f.Reason
+		if f.Via != nil {
+			if f.Via.Feature != "" {
+				name += " (" + f.Via.Feature + ", " + f.Via.Priority + ")"
+			}
+			if f.Kind != resolve.Dlopen {
+				reason = fmt.Sprintf("in what dlopen %s loads: %s", f.Via.Soname, f.Reason)
+			}
+		}
+		t.flat = flat(v, f.From, sev, f.Kind, name, reason)
 		if f.Kind == resolve.Dlopen && f.Via != nil {
 			t.group = group(f.Via.Priority)
 		}
 		return t
 	}
+	// visited is every file whose own start node was drawn.
+	visited := map[string]bool{}
 	// up holds the nodes on the way down to from: only a node among them is
 	// not expanded again, which a dependency cycle needs to end.
 	// lib is a file loaded as a library, whose PT_INTERP, as libc.so.6 has
-	// one, the loader does not read.
-	var build func(v *view, x resolve.Start, from string, lib bool, up map[string]bool) []*tline
+	// one, the loader does not read. ld is the dynamic loader of the
+	// program all this is loaded for, "" when it names none: it is drawn
+	// once, as that program's interpreter, and an edge to it from further
+	// down, as libc.so.6 needs it, is left out like a pruned library.
+	var build func(v *view, x resolve.Start, from string, lib bool, up map[string]bool, ld string) []*tline
 	// under is what is drawn under file p, reached from start x in v: p's
 	// own start node when it has one, else what x's load did from p.
-	under := func(v *view, x resolve.Start, p string, lib bool, up map[string]bool) []*tline {
+	under := func(v *view, x resolve.Start, p string, lib bool, up map[string]bool, ld string) []*tline {
 		up[p] = true
 		defer delete(up, p)
 		if next, ok := v.starts[p]; ok {
-			return build(v, next, p, lib, up)
+			if v.c == c {
+				visited[p] = true
+			}
+			return build(v, next, p, lib, up, ld)
 		}
-		return build(v, x, p, lib, up)
+		return build(v, x, p, lib, up, ld)
 	}
-	build = func(v *view, x resolve.Start, from string, lib bool, up map[string]bool) []*tline {
+	build = func(v *view, x resolve.Start, from string, lib bool, up map[string]bool, ld string) []*tline {
 		var out []*tline
+		if !lib {
+			ld = ""
+			for _, l := range x.Links {
+				if l.From == from && l.Kind == resolve.Interp {
+					ld = l.To
+				}
+			}
+		}
 		for _, l := range x.Links {
 			if l.From != from || lib && l.Kind == resolve.Interp {
 				continue
 			}
-			kind := st.wrap(st.dim, l.Kind)
-			if l.Kind == resolve.Dlopen {
-				kind = st.wrap(st.dlopen, l.Kind)
-			}
-			text := kind + " " + l.Name
+			t := &tline{rank: rankEdge, name: l.Name, to: l.To, note: l.Note != nil}
+			text := " " + l.Name
 			switch {
 			case l.Note != nil && l.Note.Priority == elf.PriorityStrings:
-				text = st.wrap(st.dlopen, elf.PriorityStrings) + " " + l.Name
-			case l.Note != nil:
+				t.say(paintDlopen, elf.PriorityStrings)
+			case l.Kind == resolve.Dlopen:
+				t.say(paintDlopen, l.Kind)
+			default:
+				t.say(paintDim, l.Kind)
+			}
+			if l.Note != nil && l.Note.Priority != elf.PriorityStrings {
 				text += " (" + l.Note.Feature + ", " + l.Note.Priority + ")"
 			}
-			hidden := pruned(prune, a, l.Name, l.To)
+			hidden := pruned(prune, a, l.Name, l.To) || ld != "" && l.To == ld && l.Kind != resolve.Interp
 			if l.To != l.Name {
 				text += " -> " + l.To
 			}
-			t := &tline{text: text + owner(v, l.To), rank: rankEdge, name: l.Name, to: l.To, note: l.Note != nil}
+			owner(t.say(paintNone, text), v, l.To)
 			switch {
 			case l.Note != nil:
 				t.group = group(l.Note.Priority)
@@ -497,11 +573,11 @@ func treeOf(rep *check.Report, c *check.Cut, s string, views map[*check.Cut]*vie
 				if hidden {
 					continue
 				}
-				t.text += " " + st.wrap(st.dim, "(cycle)")
+				t.say(paintNone, " ").say(paintDim, "(cycle)")
 				out = append(out, t)
 				continue
 			}
-			t.kids = under(v, x, l.To, l.Kind != resolve.Shebang && l.Kind != resolve.Env, up)
+			t.kids = under(v, x, l.To, l.Kind != resolve.Shebang && l.Kind != resolve.Env, up, ld)
 			if hidden && !t.alerts() {
 				continue
 			}
@@ -509,7 +585,7 @@ func treeOf(rep *check.Report, c *check.Cut, s string, views map[*check.Cut]*vie
 		}
 		for _, f := range v.res.Findings {
 			if f.Start == x.Path && f.From == from {
-				out = append(out, finding(f))
+				out = append(out, finding(v, f))
 			}
 		}
 		for _, o := range v.res.Open {
@@ -525,16 +601,34 @@ func treeOf(rep *check.Report, c *check.Cut, s string, views map[*check.Cut]*vie
 				continue
 			}
 			text := fmt.Sprintf("? dlopen %s (%s, %s): %s", name, o.Entry.Feature, o.Entry.Priority, it.Reason)
+			kind, full := resolve.Dlopen, name
+			if o.Entry.Feature != "" {
+				full += " (" + o.Entry.Feature + ", " + o.Entry.Priority + ")"
+			}
 			if o.Entry.Priority == elf.PriorityStrings {
 				text = fmt.Sprintf("? strings %s: %s", name, it.Reason)
+				kind, full = elf.PriorityStrings, name
 			}
-			t := &tline{text: st.sev(it.Severity, text),
-				alert: it.Severity != check.Info, group: group(o.Entry.Priority), name: name}
-			if pc := rep.Cuts[check.Key{Slice: it.Provider, Arch: a}]; it.Provider != "" && pc != nil && pc.Res != nil && !up[it.ProviderPath] && !slices.Contains(fold, "missing") {
+			t := &tline{alert: it.Severity != check.Info, group: group(o.Entry.Priority), name: name, sev: it.Severity}
+			switch {
+			case it.Provider != "":
+				// Delivered by a slice outside the cut: named as an
+				// edge's owner is, with no reason to give.
+				text, _, _ = strings.Cut(text, ": ")
+				t.say(paintOf(it.Severity), text).say(paintNone, " ").say(paintDim, "("+it.Provider+")")
+			case it.Reason == check.Undeclared:
+				// The "?" and no owner say as much.
+				text, _, _ = strings.Cut(text, ": ")
+				t.say(paintOf(it.Severity), text)
+			default:
+				t.say(paintOf(it.Severity), text)
+			}
+			t.flat = flat(v, o.From, it.Severity, kind, full, it.Reason)
+			if pc := rep.Cuts[check.Key{Slice: it.Provider, Arch: a}]; it.Provider != "" && pc != nil && pc.Res != nil && !up[it.ProviderPath] && !slices.Contains(folds, "missing") {
 				pv := viewOf(views, pc)
 				if px, ok := pv.starts[it.ProviderPath]; ok {
 					up[it.ProviderPath] = true
-					t.kids = build(pv, px, it.ProviderPath, true, up)
+					t.kids = build(pv, px, it.ProviderPath, true, up, ld)
 					delete(up, it.ProviderPath)
 				}
 			}
@@ -552,33 +646,68 @@ func treeOf(rep *check.Report, c *check.Cut, s string, views map[*check.Cut]*vie
 		return out
 	}
 	v := viewOf(views, c)
-	repeats := slices.Contains(fold, "repeats")
+	repeats := slices.Contains(folds, "repeats")
+	// root is the line of start node x with what is under it. A link that
+	// resolves is drawn where it is used; one that does not is drawn as a
+	// root, with why.
+	root := func(x resolve.Start) *tline {
+		n := c.FS.Nodes[x.Path]
+		visited[x.Path] = true
+		if x.Kind == "symlink" {
+			t := owner((&tline{}).say(paintNone, x.Path+" -> "+n.Target), v, x.Path).say(paintNone, ": symlink")
+			for _, f := range v.res.Findings {
+				if f.Start == x.Path {
+					t.kids = append(t.kids, finding(v, f))
+				}
+			}
+			return t
+		}
+		t := owner((&tline{}).say(paintNone, x.Path), v, x.Path).say(paintNone, ": "+describe(x, n))
+		t.kids = build(v, x, x.Path, x.Kind == "lib", map[string]bool{x.Path: true}, "")
+		if repeats {
+			t.kids = foldRepeats(t.kids, map[string]bool{x.Path: true})
+		}
+		return t
+	}
+	// wrong reports whether x's own load left a finding or a dlopen worse
+	// than info.
+	wrong := func(x resolve.Start) bool {
+		for _, f := range v.res.Findings {
+			if f.Start == x.Path {
+				return true
+			}
+		}
+		for _, o := range v.res.Open {
+			if it, ok := verdict[o.From+"\x00"+strings.Join(o.Entry.Soname, " or ")]; o.Start == x.Path && ok && it.Severity != check.Info {
+				return true
+			}
+		}
+		return false
+	}
 	var roots []*tline
 	for _, x := range c.Res.Starts {
 		if !slices.Contains(c.Owners[x.Path], s) {
 			continue
 		}
-		n := c.FS.Nodes[x.Path]
 		if x.Kind == "symlink" {
-			// A link that resolves is drawn where it is used; one that
-			// does not is drawn here, with why.
-			t := &tline{text: x.Path + " -> " + n.Target + owner(v, x.Path) + ": symlink"}
-			for _, f := range v.res.Findings {
-				if f.Start == x.Path {
-					t.kids = append(t.kids, finding(f))
-				}
-			}
-			if len(t.kids) > 0 {
+			if t := root(x); len(t.kids) > 0 {
 				roots = append(roots, t)
 			}
 			continue
 		}
-		t := &tline{text: x.Path + owner(v, x.Path) + ": " + describe(x, n)}
-		t.kids = build(v, x, x.Path, x.Kind == "lib", map[string]bool{x.Path: true})
-		if repeats {
-			t.kids = foldRepeats(t.kids, map[string]bool{x.Path: true})
+		roots = append(roots, root(x))
+	}
+	// A start node of another slice that nothing above reached is still
+	// part of the cut: it is drawn when something is wrong with it, since
+	// a finding is never left out. One of a named slice is drawn in that
+	// slice's own block.
+	for _, x := range c.Res.Starts {
+		if visited[x.Path] || !wrong(x) || slices.ContainsFunc(c.Owners[x.Path], func(o string) bool { return slices.Contains(rep.Named, o) }) {
+			continue
 		}
-		roots = append(roots, t)
+		if t := root(x); t.alerts() {
+			roots = append(roots, t)
+		}
 	}
 	return roots
 }

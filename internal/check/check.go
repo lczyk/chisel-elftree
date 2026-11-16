@@ -101,6 +101,9 @@ type Item struct {
 	ProviderPath string `json:"provider_path,omitempty"`
 }
 
+// Undeclared is the reason of a dlopen no slice of the release declares.
+const Undeclared = "no slice declares it"
+
 // Report is the outcome of a run.
 type Report struct {
 	Arches []string
@@ -806,7 +809,7 @@ func (r *run) attribute(rep *Report) {
 			case w != nil && w.err != nil:
 				it.Severity, it.Reason = Hard, "lookup failed: "+w.err.Error()
 			default:
-				it.Severity, it.Reason = Soft, "no slice declares it"
+				it.Severity, it.Reason = Soft, Undeclared
 				if w != nil && len(w.rejected) > 0 {
 					it.Reason = "no slice delivers it (" + strings.Join(w.rejected, "; ") + ")"
 				}

@@ -11,11 +11,15 @@ import (
 	"github.com/lczyk/chisel-elftree/internal/rootfs"
 )
 
+// ln is a line saying text with kids under it.
+func ln(text string, kids ...*tline) *tline {
+	t := (&tline{}).say(paintNone, text)
+	t.kids = kids
+	return t
+}
+
 func TestDrawTree(t *testing.T) {
-	roots := []*tline{{text: "/a", kids: []*tline{
-		{text: "b", kids: []*tline{{text: "c"}}},
-		{text: "d", kids: []*tline{{text: "e"}, {text: "f"}}},
-	}}}
+	roots := []*tline{ln("/a", ln("b", ln("c")), ln("d", ln("e"), ln("f")))}
 	var b bytes.Buffer
 	drawTree(&b, roots, style{})
 	want := `/a
@@ -53,30 +57,39 @@ func TestDescribe(t *testing.T) {
 
 // Every finding line says its severity, and is painted by it when coloured.
 func TestRenderTextSeverity(t *testing.T) {
-	rep := &check.Report{Arches: []string{"arm64"}, Named: []string{"a_b"}, Cuts: map[check.Key]*check.Cut{}}
+	x := "/usr/bin/x"
+	open := func(name, feature string) resolve.Open {
+		return resolve.Open{Start: x, From: x, Entry: elf.DlopenEntry{Soname: []string{name}, Feature: feature, Priority: "suggested"}}
+	}
+	c := &check.Cut{
+		Key:       check.Key{Slice: "a_b", Arch: "arm64"},
+		Available: true,
+		Owners:    map[string][]string{x: {"a_b"}},
+		FS:        &rootfs.FS{Nodes: map[string]*rootfs.Node{x: {Path: x, ELF: &elf.File{Interp: "/lib/ld.so"}}}},
+		Res: &resolve.Result{
+			Starts:   []resolve.Start{{Path: x, Kind: "exec"}},
+			Findings: []resolve.Finding{{Start: x, From: x, Kind: resolve.Needed, Name: "libx.so.1", Reason: "not found"}},
+			Open:     []resolve.Open{open("liby.so.1", "y"), open("libz.so.1", "z")},
+		},
+	}
+	rep := &check.Report{Arches: []string{"arm64"}, Named: []string{"a_b"}, Cuts: map[check.Key]*check.Cut{c.Key: c}}
 	for _, it := range []check.Item{
-		{Severity: check.Hard, Kind: "needed", Name: "libx.so.1", Reason: "not found"},
-		{Severity: check.Soft, Kind: "dlopen", Name: "liby.so.1", Feature: "y", Priority: "suggested", Reason: "no slice declares it"},
-		{Severity: check.Info, Kind: "dlopen", Name: "libz.so.1", Feature: "z", Priority: "suggested", Reason: "delivered by z_libs, not an essential"},
+		{Severity: check.Soft, Kind: "dlopen", Name: "liby.so.1", Reason: "no slice declares it"},
+		{Severity: check.Info, Kind: "dlopen", Name: "libz.so.1", Reason: "delivered by z_libs, not an essential"},
 	} {
-		it.Arch, it.Against, it.Named, it.Path, it.Sev = "arm64", "a_b", true, "/usr/bin/x", it.Severity.String()
+		it.Arch, it.Path = "arm64", x
 		rep.Items = append(rep.Items, it)
 	}
 	var plain, painted bytes.Buffer
-	renderText(&plain, rep, false, nil, style{})
-	renderText(&painted, rep, false, nil, colours)
-	for _, want := range []string{
-		"a_b [arm64]\n",
-		"/usr/bin/x: hard needed libx.so.1: not found\n",
-		"/usr/bin/x: soft dlopen liby.so.1 (y, suggested): no slice declares it\n",
-		"/usr/bin/x: info dlopen libz.so.1 (z, suggested): delivered by z_libs, not an essential\n",
-	} {
-		if !strings.Contains(plain.String(), want) {
-			t.Errorf("plain: no %q in\n%s", want, plain.String())
-		}
-	}
-	if i, j := strings.Index(plain.String(), ": soft "), strings.Index(plain.String(), ": info "); i > j {
-		t.Error("soft after info")
+	renderText(&plain, rep, false, nil, nil, style{})
+	renderText(&painted, rep, false, nil, nil, colours)
+	want := `a_b [arm64]
+/usr/bin/x: hard needed libx.so.1: not found
+/usr/bin/x: soft dlopen liby.so.1 (y, suggested): no slice declares it
+/usr/bin/x: info dlopen libz.so.1 (z, suggested): delivered by z_libs, not an essential
+`
+	if plain.String() != want {
+		t.Errorf("got\n%s\nwant\n%s", plain.String(), want)
 	}
 	for _, want := range []string{
 		colours.name + "a_b" + colours.reset,
@@ -133,7 +146,7 @@ func TestPrune(t *testing.T) {
 	}
 	rep := &check.Report{Arches: []string{"arm64"}, Named: []string{"a_b"}, Cuts: map[check.Key]*check.Cut{c.Key: c}}
 	var b bytes.Buffer
-	renderTree(&b, rep, []string{"libc.so.*", "liby.so.1"}, nil, style{})
+	renderTree(&b, rep, false, []string{"libc.so.*", "liby.so.1"}, nil, style{})
 	want := `a_b [arm64]
 /usr/bin/x (a_b): executable
 └─ needed liby.so.1 -> /lib/liby.so.1 (y_libs)
@@ -143,17 +156,25 @@ func TestPrune(t *testing.T) {
 		t.Errorf("got\n%s\nwant\n%s", b.String(), want)
 	}
 
+	// The text report leaves out what the tree does: a dlopen answered
+	// elsewhere that is pruned by name or under a pruned library, never a
+	// finding or a dlopen no slice answers.
 	for _, it := range []check.Item{
 		{Severity: check.Info, Path: x, Kind: "dlopen", Name: "libz.so.1", Reason: "delivered by z_libs, not an essential"},
 		{Severity: check.Info, Path: "/lib/libc.so.6", Kind: "dlopen", Name: "libw.so.1", Reason: "delivered by w_libs, not an essential"},
 		{Severity: check.Soft, Path: x, Kind: "dlopen", Name: "libv.so.1", Reason: "no slice declares it"},
 	} {
-		it.Arch, it.Against, it.Named, it.Sev = "arm64", "a_b", true, it.Severity.String()
+		it.Arch = "arm64"
 		rep.Items = append(rep.Items, it)
+		c.Res.Open = append(c.Res.Open, resolve.Open{Start: x, From: it.Path, Entry: elf.DlopenEntry{Soname: []string{it.Name}, Priority: "suggested"}})
 	}
 	b.Reset()
-	renderText(&b, rep, false, []string{"libz.so.1", "libc.so.*", "libv.so.1"}, style{})
-	if got := b.String(); got != "a_b [arm64]\n/usr/bin/x: soft dlopen libv.so.1: no slice declares it\n" {
+	renderText(&b, rep, false, []string{"libz.so.1", "libc.so.*", "libv.so.1"}, nil, style{})
+	want = `a_b [arm64]
+/lib/liby.so.1 (y_libs): hard needed libq.so.1: not found
+/usr/bin/x: soft dlopen libv.so.1: no slice declares it
+`
+	if got := b.String(); got != want {
 		t.Errorf("text:\n%s", got)
 	}
 }
@@ -176,7 +197,7 @@ func TestTreeFull(t *testing.T) {
 	}
 	rep := &check.Report{Arches: []string{"arm64"}, Named: []string{"a_b"}, Cuts: map[check.Key]*check.Cut{c.Key: c}}
 	var b bytes.Buffer
-	renderTree(&b, rep, nil, nil, style{})
+	renderTree(&b, rep, false, nil, nil, style{})
 	want := `a_b [arm64]
 /usr/bin/x (a_b): executable
 ├─ needed liba.so -> /lib/liba.so
@@ -194,7 +215,8 @@ func TestTreeFull(t *testing.T) {
 // What the loader links in comes first under a node, the dynamic loader
 // itself first and the rest by name, its findings after, then dlopens by
 // priority, required, recommended, suggested, each by name, whatever the
-// order found.
+// order found. The program's need of its own loader says nothing its
+// interpreter line has not.
 func TestTreeLoaderFirst(t *testing.T) {
 	x := "/usr/bin/x"
 	c := &check.Cut{
@@ -218,11 +240,10 @@ func TestTreeLoaderFirst(t *testing.T) {
 	}
 	rep := &check.Report{Arches: []string{"arm64"}, Named: []string{"a_b"}, Cuts: map[check.Key]*check.Cut{c.Key: c}}
 	var b bytes.Buffer
-	renderTree(&b, rep, nil, nil, style{})
+	renderTree(&b, rep, false, nil, nil, style{})
 	want := `a_b [arm64]
 /usr/bin/x (a_b): executable
 ├─ interp /lib/ld.so
-├─ needed zz-ld.so -> /lib/ld.so
 ├─ needed liba.so -> /lib/liba.so
 ├─ ! needed libq.so: not found
 ├─ dlopen libd.so (d, required) -> /lib/libd.so
@@ -270,27 +291,28 @@ func TestTreeIsolated(t *testing.T) {
 		Items: []check.Item{{Arch: "arm64", Against: "a_b", Named: true, Severity: check.Info, Sev: "info", Path: a, Kind: resolve.Dlopen,
 			Name: "libp.so", Reason: "delivered by p_libs", Provider: "p_libs", ProviderPath: "/lib/libp.so"}}}
 	var b bytes.Buffer
-	renderTree(&b, rep, nil, nil, style{})
+	renderTree(&b, rep, false, nil, nil, style{})
 	want := `a_b [arm64]
 /usr/bin/x (a_b): executable
 └─ needed liba.so -> /lib/liba.so
    ├─ needed libb.so -> /lib/libb.so
-   └─ ? dlopen libp.so (p, suggested): delivered by p_libs
+   └─ ? dlopen libp.so (p, suggested) (p_libs)
       └─ needed libq.so -> /lib/libq.so (q_libs)
 `
 	if b.String() != want {
 		t.Errorf("got\n%s\nwant\n%s", b.String(), want)
 	}
-	// --fold missing: the line, not what is under it.
+	// without --show-missing: the line, not what is under it.
 	b.Reset()
-	renderTree(&b, rep, nil, []string{"missing"}, style{})
+	renderTree(&b, rep, false, nil, []string{"missing"}, style{})
 	if want := strings.TrimSuffix(want, "      └─ needed libq.so -> /lib/libq.so (q_libs)\n"); b.String() != want {
 		t.Errorf("fold missing: got\n%s\nwant\n%s", b.String(), want)
 	}
 }
 
 // A library with a PT_INTERP of its own, as libc.so.6, shows none when
-// loaded as a library: the loader does not read it then.
+// loaded as a library: the loader does not read it then. Nor is its need
+// of the loader drawn, that being the program's own, drawn once above.
 func TestTreeLibraryInterp(t *testing.T) {
 	x, libc := "/usr/bin/x", "/lib/libc.so.6"
 	c := &check.Cut{
@@ -311,19 +333,18 @@ func TestTreeLibraryInterp(t *testing.T) {
 	}
 	rep := &check.Report{Arches: []string{"arm64"}, Named: []string{"a_b"}, Cuts: map[check.Key]*check.Cut{c.Key: c}}
 	var b bytes.Buffer
-	renderTree(&b, rep, nil, nil, style{})
+	renderTree(&b, rep, false, nil, nil, style{})
 	want := `a_b [arm64]
 /usr/bin/x (a_b): executable
 ├─ interp /lib/ld.so
 └─ needed libc.so.6 -> /lib/libc.so.6
-   └─ needed ld.so -> /lib/ld.so
 `
 	if b.String() != want {
 		t.Errorf("got\n%s\nwant\n%s", b.String(), want)
 	}
 }
 
-// --fold repeats: a library is drawn once under a start node, as lddtree
+// --fold-repeats: a library is drawn once under a start node, as lddtree
 // does: the lines right under a node claim theirs first, so libb is the
 // start's own dlopen and not drawn again under liba, nor libc under either.
 func TestFoldRepeats(t *testing.T) {
@@ -344,12 +365,55 @@ func TestFoldRepeats(t *testing.T) {
 	}
 	rep := &check.Report{Arches: []string{"arm64"}, Named: []string{"a_b"}, Cuts: map[check.Key]*check.Cut{c.Key: c}}
 	var b bytes.Buffer
-	renderTree(&b, rep, nil, []string{"repeats"}, style{})
+	renderTree(&b, rep, false, nil, []string{"repeats"}, style{})
 	want := `a_b [arm64]
 /usr/bin/x (a_b): executable
 ├─ needed liba.so -> /lib/liba.so
 ├─ needed libc.so -> /lib/libc.so
 └─ dlopen libb.so (b, suggested) -> /lib/libb.so
+`
+	if b.String() != want {
+		t.Errorf("got\n%s\nwant\n%s", b.String(), want)
+	}
+}
+
+// The loader is drawn once for a program, as its interpreter. A library
+// drawn on its own is no program's: its need of the loader is drawn, first.
+// A program run by another, as a script's interpreter, has a loader of its
+// own, drawn under it.
+func TestTreeLoaderOnce(t *testing.T) {
+	lib, sh, script, libc, ld := "/lib/libz.so", "/bin/sh", "/usr/bin/s", "/lib/libc.so.6", "/lib/ld.so"
+	needs := func(from string) []resolve.Link {
+		return []resolve.Link{
+			{From: from, Kind: resolve.Needed, Name: "libc.so.6", To: libc},
+			{From: libc, Kind: resolve.Needed, Name: "ld.so", To: ld},
+		}
+	}
+	c := &check.Cut{
+		Key:       check.Key{Slice: "a_b", Arch: "arm64"},
+		Available: true,
+		Owners:    map[string][]string{lib: {"a_b"}, script: {"a_b"}},
+		FS: &rootfs.FS{Nodes: map[string]*rootfs.Node{
+			lib: {Path: lib, ELF: &elf.File{}}, sh: {Path: sh, ELF: &elf.File{Interp: ld}}, script: {Path: script},
+		}},
+		Res: &resolve.Result{Starts: []resolve.Start{
+			{Path: lib, Kind: "lib", Links: append([]resolve.Link{{From: lib, Kind: resolve.Needed, Name: "ld.so", To: ld}}, needs(lib)...)},
+			{Path: sh, Kind: "exec", Links: append([]resolve.Link{{From: sh, Kind: resolve.Interp, Name: ld, To: ld}}, needs(sh)...)},
+			{Path: script, Kind: "script", Links: []resolve.Link{{From: script, Kind: resolve.Shebang, Name: sh, To: sh}}},
+		}},
+	}
+	rep := &check.Report{Arches: []string{"arm64"}, Named: []string{"a_b"}, Cuts: map[check.Key]*check.Cut{c.Key: c}}
+	var b bytes.Buffer
+	renderTree(&b, rep, false, nil, nil, style{})
+	want := `a_b [arm64]
+/lib/libz.so (a_b): shared library
+├─ needed ld.so -> /lib/ld.so
+└─ needed libc.so.6 -> /lib/libc.so.6
+   └─ needed ld.so -> /lib/ld.so
+/usr/bin/s (a_b): script
+└─ shebang /bin/sh
+   ├─ interp /lib/ld.so
+   └─ needed libc.so.6 -> /lib/libc.so.6
 `
 	if b.String() != want {
 		t.Errorf("got\n%s\nwant\n%s", b.String(), want)

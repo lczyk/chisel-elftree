@@ -34,8 +34,9 @@ type options struct {
 	Arches      []string `long:"arch" value-name:"<a>[,<a>...]" description:"architectures to check; \"all\" for every one (default: host)"`
 	Slices      []string `long:"slice" value-name:"<s>[,<s>...]" description:"only these slices, bare or <package>_<slice> (default: all)"`
 	Files       []string `long:"file" value-name:"<glob>[,...]" description:"only the files matching, and what they go on to, are checked (chisel glob syntax)"`
-	Prune       []string `long:"prune" value-name:"<glob>[,...]" description:"leave the libraries matching by name or path out of the tree and the info lines; a finding in one still shows (chisel glob syntax)"`
-	Fold        []string `long:"fold" value-name:"<what>[,...]" description:"with --tree, what not to draw: \"missing\" is what a dlopen outside the cut would load, \"repeats\" a library drawn already, as lddtree does"`
+	Prune       []string `long:"prune" value-name:"<glob>[,...]" description:"leave the libraries matching by name or path out of the tree and the info lines, on top of @ld, the architecture's dynamic loader, which is left out by default; a finding in one still shows; an empty value forgets what was to be left out so far, @ld too (chisel glob syntax)"`
+	ShowMissing bool     `long:"show-missing" description:"under a dlopen a slice outside the cut delivers, draw what it would load, from that slice's cut"`
+	FoldRepeats bool     `long:"fold-repeats" description:"leave out of the trees the reports are made from a library drawn already under its start node, as lddtree does"`
 	NoStrings   bool     `long:"no-strings" description:"do not scan the files' strings for library names no link table or dlopen note has"`
 	Tree        bool     `short:"T" long:"tree" description:"draw each named slice's graph instead of the findings only"`
 	JSON        bool     `long:"json" description:"machine-readable output, unpruned"`
@@ -93,8 +94,19 @@ without a file name (and, for --prune, a library's name as asked for), and
 CHISEL=/path/to/chisel. "version" and "help" as the first argument are
 --version and --help.`
 
-// folds are what --fold takes.
-var folds = []string{"missing", "repeats"}
+// folds is what the trees leave out: what a dlopen outside the cut would
+// load, unless --show-missing, and with --fold-repeats a library drawn
+// already.
+func (o options) folds() []string {
+	var out []string
+	if !o.ShowMissing {
+		out = append(out, "missing")
+	}
+	if o.FoldRepeats {
+		out = append(out, "repeats")
+	}
+	return out
+}
 
 func newParser(o *options) *flags.Parser {
 	p := flags.NewNamedParser("chisel-elftree", flags.HelpFlag|flags.PassDoubleDash)
@@ -122,14 +134,10 @@ func parseArgs(args []string, help io.Writer) (o options, pkgs []string, err err
 		}
 		return o, nil, err
 	}
-	for _, l := range []*[]string{&o.Arches, &o.Slices, &o.Files, &o.Prune, &o.Fold} {
+	for _, l := range []*[]string{&o.Arches, &o.Slices, &o.Files} {
 		*l = splitLists(*l)
 	}
-	for _, f := range o.Fold {
-		if !slices.Contains(folds, f) {
-			return o, nil, fmt.Errorf("--fold %s: not one of %s", f, strings.Join(folds, ", "))
-		}
-	}
+	o.Prune = pruneList(o.Prune)
 	for i, pkg := range pkgs {
 		pkgs[i] = packageslicesfile.Package(pkg)
 	}
@@ -138,6 +146,25 @@ func parseArgs(args []string, help io.Writer) (o options, pkgs []string, err err
 
 // splitLists splits every value of a repeatable list flag on commas and drops
 // the blanks, so --arch amd64,arm64 and --arch amd64 --arch arm64 are the same.
+// pruneList is what --prune leaves out, given its values in order: the
+// dynamic loader to begin with, every value added to that, and an empty
+// value forgetting all before it, as a list setting of systemd is reset.
+func pruneList(vals []string) []string {
+	out := []string{loaderToken}
+	for _, v := range vals {
+		if strings.TrimSpace(v) == "" {
+			out = nil
+			continue
+		}
+		for _, g := range splitLists([]string{v}) {
+			if !slices.Contains(out, g) {
+				out = append(out, g)
+			}
+		}
+	}
+	return out
+}
+
 func splitLists(vals []string) []string {
 	var out []string
 	for _, v := range vals {
@@ -224,11 +251,11 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	}
 	switch {
 	case o.JSON:
-		renderJSON(stdout, rep)
+		renderJSON(stdout, rep, o.NoGroup, o.Prune, o.folds())
 	case o.Tree:
-		renderTree(stdout, rep, o.Prune, o.Fold, styleFor(stdout))
+		renderTree(stdout, rep, o.NoGroup, o.Prune, o.folds(), styleFor(stdout))
 	default:
-		renderText(stdout, rep, o.NoGroup, o.Prune, styleFor(stdout))
+		renderText(stdout, rep, o.NoGroup, o.Prune, o.folds(), styleFor(stdout))
 	}
 	if len(o.Verbose) > 0 && rep.Validations > 0 {
 		fmt.Fprintf(stderr, "%s %d validations\n", cut.Stamp(), rep.Validations)
@@ -314,7 +341,30 @@ func version() string {
 	return "(devel)"
 }
 
-func renderJSON(w io.Writer, rep *check.Report) {
+// lineOut is a line of a block's tree in the json.
+type lineOut struct {
+	Line string `json:"line"`
+	// Context is a line held only for what is under it: it belongs to a
+	// block of more architectures.
+	Context  bool      `json:"context,omitempty"`
+	Severity string    `json:"severity,omitempty"` // of a finding or a dlopen the cut does not answer
+	Finding  string    `json:"finding,omitempty"`  // such a line as the text report prints it
+	Under    []lineOut `json:"under,omitempty"`
+}
+
+func linesOut(ts []*tline) []lineOut {
+	var out []lineOut
+	for _, t := range ts {
+		lo := lineOut{Line: t.plain(), Context: t.context, Under: linesOut(t.kids)}
+		if t.flat != "" && !t.context {
+			lo.Severity, lo.Finding = t.sev.String(), t.flat
+		}
+		out = append(out, lo)
+	}
+	return out
+}
+
+func renderJSON(w io.Writer, rep *check.Report, noGroup bool, prune, folds []string) {
 	type linkOut struct {
 		From   string   `json:"from"`
 		Kind   string   `json:"kind"`
@@ -346,12 +396,24 @@ func renderJSON(w io.Writer, rep *check.Report) {
 		Starts    []startOut `json:"starts,omitempty"`
 		Foreign   []string   `json:"foreign,omitempty"`
 	}
+	// A block is what the text report and the tree draw: a named slice's
+	// tree as a group of architectures shares it.
+	type blockOut struct {
+		Slice   string    `json:"slice"`
+		Version string    `json:"version,omitempty"`
+		Arches  []string  `json:"arches"`
+		Tree    []lineOut `json:"tree"`
+	}
 	out := struct {
 		Arches []string     `json:"arches"`
 		Named  []string     `json:"named"`
 		Cuts   []cutOut     `json:"cuts"`
 		Items  []check.Item `json:"findings"`
-	}{Arches: rep.Arches, Named: rep.Named, Items: rep.Items}
+		Blocks []blockOut   `json:"blocks"`
+	}{Arches: rep.Arches, Named: rep.Named, Items: rep.Items, Blocks: []blockOut{}}
+	for _, b := range blocks(rep, noGroup, prune, folds) {
+		out.Blocks = append(out.Blocks, blockOut{Slice: b.Slice, Version: strings.TrimSpace(b.Version), Arches: b.Arches, Tree: linesOut(b.Roots)})
+	}
 	if out.Items == nil {
 		out.Items = []check.Item{}
 	}
