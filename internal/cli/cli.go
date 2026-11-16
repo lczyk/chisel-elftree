@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"runtime/debug"
 	"slices"
 	"strings"
 	"syscall"
@@ -23,6 +22,9 @@ import (
 	"github.com/lczyk/chisel-coverage/pkg/release"
 	"gopkg.in/yaml.v3"
 
+	ver "github.com/lczyk/version/go"
+
+	chiselelftree "github.com/lczyk/chisel-elftree"
 	"github.com/lczyk/chisel-elftree/internal/check"
 	"github.com/lczyk/chisel-elftree/internal/manifest"
 	"github.com/lczyk/chisel-elftree/internal/resolve"
@@ -39,7 +41,7 @@ type options struct {
 	FoldRepeats bool     `long:"fold-repeats" description:"leave out of the trees the reports are made from a library drawn already under its start node, as lddtree does"`
 	NoStrings   bool     `long:"no-strings" description:"do not scan the files' strings for library names no link table or dlopen note has"`
 	Tree        bool     `short:"T" long:"tree" description:"draw each named slice's graph instead of the findings only"`
-	JSON        bool     `long:"json" description:"machine-readable output, unpruned"`
+	JSON        bool     `long:"json" description:"machine-readable output: every cut's graph unpruned, and the blocks the reports draw"`
 	FailMissing bool     `long:"fail-missing" description:"exit 1 on a hard finding, or an unresolvable required dlopen, counting against a named slice"`
 	Strict      bool     `long:"strict" description:"with --fail-missing, any unresolvable dlopen counting against a named slice fails too"`
 	FailReached bool     `long:"fail-reached" description:"with --fail-missing, findings counting only against reached slices fail too"`
@@ -80,8 +82,10 @@ what is found, by severity:
 - warning: the loader carries on, but something is off
 - info: a slice delivers a dlopen target, but it is not an essential
 
-a finding counts against the named slice whose file it starts from, else it
-is shown as reached via that slice, against the slice delivering the file.
+every report shows a named slice's tree, folded across the architectures that
+agree on it. a finding counts against the named slice whose file it starts
+from; one about a file a reached slice delivers names that slice, and fails
+only with --fail-reached.
 config-driven loading (nsswitch, pam, openssl.cnf, gconv) is not followed.
 
 a package may be given as the path of its file, slices/<package>.yaml, and
@@ -199,7 +203,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	if o.Version {
-		fmt.Fprintln(stdout, "chisel-elftree", version())
+		fmt.Fprintln(stdout, ver.Read(fileVersion(chiselelftree.VersionFile)))
 		return 0
 	}
 	if len(pkgs) == 0 {
@@ -333,12 +337,16 @@ func fails(rep *check.Report, strict, reached bool) bool {
 	return false
 }
 
-// version is the module version the binary was built from.
-func version() string {
-	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" {
-		return bi.Main.Version
+// fileVersion returns the version line of a VERSION file: the first line that
+// is neither blank nor a # comment.
+func fileVersion(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			return line
+		}
 	}
-	return "(devel)"
+	return ""
 }
 
 // lineOut is a line of a block's tree in the json.

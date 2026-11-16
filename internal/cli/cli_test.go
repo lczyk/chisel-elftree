@@ -1,8 +1,12 @@
 package cli
 
 import (
+	"bytes"
 	"slices"
+	"strings"
 	"testing"
+
+	chiselelftree "github.com/lczyk/chisel-elftree"
 )
 
 func TestPruneList(t *testing.T) {
@@ -35,6 +39,29 @@ func TestParseArgsPrune(t *testing.T) {
 		o, _, err := parseArgs(c.args, nil)
 		if err != nil || !slices.Equal(o.Prune, c.want) {
 			t.Errorf("%q: got %q, %v; want %q", c.args, o.Prune, err, c.want)
+		}
+	}
+}
+
+func TestFileVersion(t *testing.T) {
+	if got := fileVersion("# a comment\n\n 1.2.3 \n4.5.6\n"); got != "1.2.3" {
+		t.Errorf("got %q", got)
+	}
+	if got := fileVersion("# only a comment\n"); got != "" {
+		t.Errorf("got %q", got)
+	}
+	// The tool's own VERSION file, whatever version it is at.
+	if v := fileVersion(chiselelftree.VersionFile); strings.Count(v, ".") != 2 {
+		t.Errorf("VERSION holds %q", v)
+	}
+}
+
+func TestVersion(t *testing.T) {
+	var out bytes.Buffer
+	for _, args := range [][]string{{"version"}, {"--version"}} {
+		out.Reset()
+		if code := Main(args, &out, &out); code != 0 || !strings.Contains(out.String(), fileVersion(chiselelftree.VersionFile)) {
+			t.Errorf("%q: %d %q", args, code, out.String())
 		}
 	}
 }

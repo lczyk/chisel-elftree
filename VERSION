@@ -1,2 +1,4 @@
+# VERSION file for chisel-elftree
+# source of truth for the version number
 # tags: pkg
 0.1.0
