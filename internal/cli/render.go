@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/lczyk/chisel-coverage/pkg/fold"
+	"github.com/lczyk/chisel-coverage/pkg/pathtree"
 
 	"github.com/lczyk/chisel-elftree/internal/check"
 	"github.com/lczyk/chisel-elftree/internal/elf"
@@ -357,20 +358,16 @@ func (t *tline) alerts() bool {
 // drawTree draws roots with no box drawing and everything under them with
 // it, as chisel-diff --tree does.
 func drawTree(w io.Writer, roots []*tline, st style) {
-	for _, r := range roots {
-		fmt.Fprintln(w, r.painted(st))
-		drawKids(w, r.kids, "", st)
-	}
-}
-
-func drawKids(w io.Writer, kids []*tline, prefix string, st style) {
-	for i, k := range kids {
-		glyph, pad := "├─ ", "│  "
-		if i == len(kids)-1 {
-			glyph, pad = "└─ ", "   "
+	var nodes func(ts []*tline) []*pathtree.Node
+	nodes = func(ts []*tline) []*pathtree.Node {
+		out := make([]*pathtree.Node, len(ts))
+		for i, t := range ts {
+			out[i] = &pathtree.Node{Line: t.painted(st), Kids: nodes(t.kids)}
 		}
-		fmt.Fprintln(w, st.wrap(st.dim, prefix+glyph)+k.painted(st))
-		drawKids(w, k.kids, prefix+pad, st)
+		return out
+	}
+	for _, line := range pathtree.Draw(nodes(roots), func(s string) string { return st.wrap(st.dim, s) }) {
+		fmt.Fprintln(w, line)
 	}
 }
 

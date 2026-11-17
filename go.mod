@@ -6,7 +6,7 @@ require (
 	github.com/canonical/chisel v1.5.1
 	github.com/jessevdk/go-flags v1.6.1
 	github.com/klauspost/compress v1.18.0
-	github.com/lczyk/chisel-coverage/pkg v0.9.0
+	github.com/lczyk/chisel-coverage/pkg v0.10.0
 	github.com/lczyk/chisel-elftree/pkg v0.0.0-00010101000000-000000000000
 	github.com/lczyk/chisel-proxy/pkg v0.5.0
 	github.com/lczyk/version/go v0.6.0
